@@ -19,32 +19,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Merge upstream
         id: merge
         run: |
           set -e
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/maillab/cloud-mail.git || true
           git fetch --no-tags upstream main
           BEHIND=$(git rev-list --count HEAD..upstream/main)
           echo "commits_behind=$BEHIND"
           if [ "$BEHIND" = "0" ]; then
-            echo "new=false" >> "$GITHUB_OUTPUT"
             echo "Already up to date."
             exit 0
           fi
-          git merge --no-edit upstream/main
-          git push origin HEAD:main
-          echo "new=true" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-edit upstream/main; then
+            echo "Merge conflict -> resolving known files"
+            git checkout upstream/main -- mail-worker/wrangler.toml || true
+            if [ -n "$(git ls-files -u)" ]; then
+              echo "Unresolved conflicts:"
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+            git commit --no-edit || true
+          fi
+          if ! grep -q "27359e93-6ad6-49f8-a210-fe033bf2c444" mail-worker/wrangler.toml; then
+            cat >> mail-worker/wrangler.toml <<'EOF'
 
-      - name: Trigger Cloudflare deploy
-        if: steps.merge.outputs.new == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run deploy-cloudflare.yml -R "$GITHUB_REPOSITORY" --ref main
+          [[d1_databases]]
+          binding = "db"
+          database_name = "mail"
+          database_id = "27359e93-6ad6-49f8-a210-fe033bf2c444"
+
+          [[kv_namespaces]]
+          binding = "kv"
+          id = "792f962984a54d5083128fb6a1c97599"
+          EOF
+            git add mail-worker/wrangler.toml
+            git commit -m "chore: ensure D1/KV bindings in wrangler.toml" || true
+          fi
+          git push origin HEAD:main
+          echo "Pushed merged upstream to main."
